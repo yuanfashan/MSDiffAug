@@ -1,6 +1,6 @@
-# MSDiffAD
+# MSDiffAug
 
-MSDiffAD is a two-stage representation learning framework for mass spectrometry data. It synergizes a generative diffusion augmentation strategy with a contrastive learning mechanism to effectively decouple molecular structural features from environmental noise, thereby acquiring robust low-dimensional chemical embeddings.
+MSDiffAug is a two-stage representation learning framework for mass spectrometry data. It synergizes a generative diffusion augmentation strategy with a contrastive learning mechanism to effectively decouple molecular structural features from environmental noise, thereby acquiring robust low-dimensional chemical embeddings.
 
 ---
 
