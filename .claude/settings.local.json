@@ -1,7 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(.venv/Scripts/python.exe -c \"import importlib.metadata as m; [print\\(p, m.version\\(p\\)\\) for p in ['torch','transformers','matchms','gensim','spec2vec','info-nce','numba','rdkit'] if \\(lambda: True\\)\\(\\) ]\")"
-    ]
-  }
-}
