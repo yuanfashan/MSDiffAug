@@ -67,6 +67,17 @@ class UniformSampler(ScheduleSampler):
     def weights(self):
         return self._weights
 
+
+class TruncatedSampler(ScheduleSampler):
+    """只从 [0, t_max) 采样时间步, 限制最大腐蚀强度。t_max=总步数时等价均匀采样。"""
+    def __init__(self, diffusion, t_max):
+        self.diffusion = diffusion
+        self._weights = np.zeros([diffusion.num_timesteps])
+        self._weights[:t_max] = 1.0
+
+    def weights(self):
+        return self._weights
+
 class FixSampler(ScheduleSampler):
     def __init__(self, diffusion):
         self.diffusion = diffusion

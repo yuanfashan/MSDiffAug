@@ -269,3 +269,100 @@ def timestep_embedding(timesteps, dim, max_period=10000):
     if dim % 2:
         embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
     return embedding
+
+
+def SearchTopATS_MemoryEfficien(dataset_arr, query_arr, dataset_smiles, query_smiles,
+                                batch=500, dataset_chunk_size=5000, device='cuda',
+                                fp_radius=2, fp_bits=2048,
+                                topk_list=(500, 250, 100, 50, 25, 10)):
+    """多档位 Top-k 类似物检索评估: ATS@k (平均最大指纹相似度)。
+
+    对每个 query 嵌入, 在谱库 (dataset) 嵌入中分块计算余弦最近邻, 只保留
+    top-K (K = max(topk_list)); 再对每个 k, 计算 query 真实结构与 top-k 命中
+    结构的 Morgan 指纹 Tanimoto 相似度, 每个 query 取最大值, 对所有 query 取
+    平均 (无效 SMILES / 无有效命中不计入)。
+
+    返回列表, 顺序与降序排列的 topk_list 一致:
+      [ATS@500, ATS@250, ATS@100, ATS@50, ATS@25, ATS@10]
+    """
+    from rdkit import Chem
+    from rdkit import RDLogger
+    from rdkit.Chem import DataStructs, rdFingerprintGenerator
+    import torch.nn.functional as F
+    RDLogger.DisableLog('rdApp.error')  # 数据中混有非 SMILES 编号, 屏蔽 RDKit 解析报错刷屏
+
+    fp_gen = rdFingerprintGenerator.GetMorganGenerator(radius=fp_radius, fpSize=fp_bits)
+
+    if torch.cuda.is_available() and device == 'cuda':
+        device = torch.device('cuda')
+    else:
+        device = torch.device('cpu')
+    torch.cuda.empty_cache()
+
+    topk_list = tuple(sorted(set(topk_list), reverse=True))
+    K = topk_list[0]
+
+    n_dataset = len(dataset_arr)
+    n_queries = len(query_arr)
+    if n_queries == 0:
+        return [float("nan")] * len(topk_list)
+
+    best_scores = torch.full((n_queries, K), float("-inf"), device=device)
+    best_indices = torch.full((n_queries, K), -1, dtype=torch.int64, device=device)
+
+    with torch.no_grad():
+        for dataset_start in range(0, n_dataset, dataset_chunk_size):
+            dataset_end = min(dataset_start + dataset_chunk_size, n_dataset)
+            dataset_chunk = F.normalize(
+                torch.from_numpy(dataset_arr[dataset_start:dataset_end]).float().to(device),
+                dim=1)
+
+            for query_start in range(0, n_queries, batch):
+                query_end = min(query_start + batch, n_queries)
+                query_batch = F.normalize(
+                    torch.from_numpy(query_arr[query_start:query_end]).float().to(device),
+                    dim=1)
+                scores = torch.mm(query_batch, dataset_chunk.t())  # (B, chunk)
+
+                q_scores = best_scores[query_start:query_end]
+                q_indices = best_indices[query_start:query_end]
+                chunk_indices = torch.arange(dataset_start, dataset_end, device=device)
+                chunk_indices = chunk_indices.unsqueeze(0).expand(scores.shape[0], -1)
+
+                all_scores = torch.cat([q_scores, scores], dim=1)  # (B, K+chunk)
+                all_indices = torch.cat([q_indices, chunk_indices], dim=1)
+                top_vals, top_pos = torch.topk(all_scores, k=K, dim=1)
+                best_scores[query_start:query_end] = top_vals
+                best_indices[query_start:query_end] = all_indices.gather(1, top_pos)
+
+            del dataset_chunk
+            if device.type == 'cuda':
+                torch.cuda.empty_cache()
+
+    best_indices = best_indices.cpu().numpy()
+
+    fp_cache = {}
+
+    def get_fp(smi):
+        if not smi:
+            return None
+        if smi not in fp_cache:
+            mol = Chem.MolFromSmiles(smi)
+            fp_cache[smi] = fp_gen.GetFingerprint(mol) if mol is not None else None
+        return fp_cache[smi]
+
+    per_query_max = [[] for _ in topk_list]
+    for i in range(n_queries):
+        fp_q = get_fp(query_smiles[i])
+        if fp_q is None:
+            continue
+        valid = best_indices[i][best_indices[i] >= 0]
+        hit_fps = [get_fp(dataset_smiles[idx]) for idx in valid]
+        hit_fps = [fp for fp in hit_fps if fp is not None]
+        if not hit_fps:
+            continue
+        sims = DataStructs.BulkTanimotoSimilarity(fp_q, hit_fps)
+        for j, k in enumerate(topk_list):
+            per_query_max[j].append(max(sims[:k]))
+
+    return [float(np.mean(v)) if v else float("nan") for v in per_query_max]

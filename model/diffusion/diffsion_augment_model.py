@@ -1,8 +1,9 @@
+import math
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .modules import TransformerEncoder, info_nce
+from model.diffusion.modules import TransformerEncoder, info_nce
 from transformers.models.deberta.modeling_deberta import DebertaEncoder
 from torch.nn import CrossEntropyLoss
 import torch as th
@@ -11,6 +12,9 @@ from utils.diff_utils import (
     linear,
     timestep_embedding
 )
+
+# 强度归一化尺度: 相对强度 [0,1] -> log1p 空间 [0,1]
+INTEN_LOG_SCALE = math.log(2.0)
 
 
 class DiffudionAugment(nn.Module):
@@ -37,6 +41,14 @@ class DiffudionAugment(nn.Module):
 
         self.item_embedding = torch.nn.Embedding(100002, args.hidden_size, padding_idx=0)
         self.position_embedding = nn.Embedding(self.max_seq_length, self.hidden_size)
+
+        # 联合 (m/z, 强度) 预测: 强度嵌入 + 强度回归头
+        self.intensity_embedding = nn.Linear(1, self.hidden_size)
+        self.intensity_head = nn.Sequential(
+            linear(self.hidden_size, self.hidden_size),
+            nn.GELU(),
+            linear(self.hidden_size, 1),
+        )
 
         self.nce_fct = nn.CrossEntropyLoss()
         self.rec_trm_encoder = TransformerEncoder(
@@ -85,8 +97,24 @@ class DiffudionAugment(nn.Module):
         if isinstance(module, nn.Linear) and module.bias is not None:
             module.bias.data.zero_()
 
-    def get_embeds(self, item_ids):
-        return self.item_embedding(item_ids)
+    def normalize_intensity(self, intensity):
+        """[B, L] 相对强度 [0,1] -> 归一化 log 强度 [0,1]"""
+        return torch.log1p(intensity) / INTEN_LOG_SCALE
+
+    def unnormalize_intensity(self, inten_norm):
+        """[B, L] 归一化 log 强度 [0,1] -> 相对强度 [0,1]"""
+        return torch.expm1(inten_norm.clamp(0.0, 1.0) * INTEN_LOG_SCALE).clamp(min=0.0, max=1.0)
+
+    def get_embeds(self, item_ids, intensity):
+        """联合嵌入: token 嵌入 + 强度嵌入 (m/z, 强度一起作为扩散输入)"""
+        token_emb = self.item_embedding(item_ids)
+        inten_norm = self.normalize_intensity(intensity).unsqueeze(-1)  # [B,L,1]
+        inten_emb = self.intensity_embedding(inten_norm)
+        return token_emb + inten_emb
+
+    def get_intensity_logits(self, hidden_repr):
+        """[B, L, H] -> [B, L] 预测归一化 log 强度"""
+        return self.intensity_head(hidden_repr).squeeze(-1)
 
     def get_logits(self, hidden_repr):
         if self.logits_mode == 1:
@@ -220,4 +248,3 @@ class DiffudionAugment(nn.Module):
                                           batch_size=aug_seq1.shape[0], sim="dot")
         nce_loss = self.nce_fct(nce_logits, nce_labels)
         return nce_loss
-
